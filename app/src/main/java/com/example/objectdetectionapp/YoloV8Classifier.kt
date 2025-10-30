@@ -1,5 +1,4 @@
 package com.example.objectdetectionapp
-
 import android.content.Context
 import android.graphics.Bitmap
 import android.util.Log
@@ -7,18 +6,19 @@ import org.tensorflow.lite.support.image.TensorImage
 import org.tensorflow.lite.task.vision.detector.Detection
 import org.tensorflow.lite.task.vision.detector.ObjectDetector
 
+
 class YoloV8Classifier(
-    context: Context,
-    private val modelPath: String = "yolov8.tflite" // ensure this file is in app/src/main/assets/
+        context: Context,
+        private val modelPath: String = "yolov8.tflite" // ensure this file is in app/src/main/assets/
 ) {
     private val TAG = "YoloV8Classifier"
     private val detector: ObjectDetector
 
     init {
         val options = ObjectDetector.ObjectDetectorOptions.builder()
-            .setMaxResults(6)        // tune as needed
-            .setScoreThreshold(0.25f) // tune as needed
-            .build()
+                .setMaxResults(6)        // tune as needed
+                .setScoreThreshold(0.25f) // tune as needed
+                .build()
 
         detector = try {
             ObjectDetector.createFromFileAndOptions(context, modelPath, options)
