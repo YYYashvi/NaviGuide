@@ -3,10 +3,15 @@ package com.example.objectdetectionapp
 import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.media.AudioManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
+import android.util.Base64
 import android.util.Log
 import android.util.Size
+import android.view.View
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -18,47 +23,61 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import com.google.android.material.button.MaterialButton
+import com.google.android.material.snackbar.Snackbar
 import com.google.android.material.switchmaterial.SwitchMaterial
-import org.tensorflow.lite.Interpreter
-import java.io.FileInputStream
-import java.io.IOException
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.nio.MappedByteBuffer
-import java.nio.channels.FileChannel
-import java.util.*
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.collections.HashMap
 
 class MainActivity : AppCompatActivity() {
 
     companion object {
-        private const val TAG = "MainActivityYOLO"
-        private const val MODEL_INPUT_SIZE = 640f
-        private const val CONFIDENCE_THRESHOLD = 0.3f
-        private const val SPEECH_PERSISTENCE_FRAMES = 3
+        private const val TAG = "MainActivityHybrid"
+
+        // Cloud Vision throttling / filtering
+        private const val CLOUD_MIN_INTERVAL_MS = 1500L
+        private const val CLOUD_MIN_SCORE = 0.45f
+
+        // TTS
         private const val SPEECH_COOLDOWN_MS = 2000L
 
-        val COCO_CLASSES = arrayOf(
-            "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat",
-            "traffic light","fire hydrant","stop sign","parking meter","bench","bird","cat",
-            "dog","horse","sheep","cow","elephant","bear","zebra","giraffe","backpack",
-            "umbrella","handbag","tie","suitcase","frisbee","skis","snowboard","sports ball",
-            "kite","baseball bat","baseball glove","skateboard","surfboard","tennis racket",
-            "bottle","wine glass","cup","fork","knife","spoon","bowl","banana","apple",
-            "sandwich","orange","broccoli","carrot","hot dog","pizza","donut","cake","chair",
-            "couch","potted plant","bed","dining table","toilet","tv","laptop","mouse","remote",
-            "keyboard","cell phone","microwave","oven","toaster","sink","refrigerator","book",
-            "clock","vase","scissors","teddy bear","hair drier","toothbrush"
-        )
+        // Prefs keys (for auto-raise volume consent)
+        private const val PREFS = "prefs"
+        private const val KEY_AUTO_RAISE_VOLUME = "auto_raise_volume"
     }
 
-    private lateinit var cameraExecutor: ExecutorService
-    private var tfliteInterpreter: Interpreter? = null
-    private lateinit var overlayView: OverlayView
+    // ===== Cloud Vision config =====
+    private val CLOUD_API_KEY: String by lazy { getString(R.string.vision_api_key) }
+    private val httpClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(12, TimeUnit.SECONDS)
+            .writeTimeout(12, TimeUnit.SECONDS)
+            .build()
+    }
+    private val JSON = "application/json; charset=utf-8".toMediaType()
+    private var lastCloudAt = 0L
 
-    // UI Elements (Material types)
+    // Vision result holder
+    private data class VisionBox(
+        val x1: Float, val y1: Float, val x2: Float, val y2: Float,
+        val score: Float, val label: String
+    )
+
+    // YOLOv8 (local) fallback
+    private var yoloClassifier: YoloV8Classifier? = null
+
+    // Camera / UI
+    private lateinit var cameraExecutor: ExecutorService
+    private lateinit var overlayView: OverlayView
     private lateinit var btnStartStop: MaterialButton
     private lateinit var switchSpeech: SwitchMaterial
     private lateinit var detectedLabel: TextView
@@ -67,10 +86,11 @@ class MainActivity : AppCompatActivity() {
     private var tts: TextToSpeech? = null
     private var lastSpoken: String? = null
     private var lastSpokenTimeMs: Long = 0L
-    private var detectionCounters: MutableMap<String, Int> = HashMap()
-
     private var isCameraRunning = true
     private var isSpeechOn = true
+
+    // For a little “persistence” on speech
+    private val detectionCounters: MutableMap<String, Int> = HashMap()
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
@@ -85,65 +105,73 @@ class MainActivity : AppCompatActivity() {
         overlayView = findViewById(R.id.overlayView)
         cameraExecutor = Executors.newSingleThreadExecutor()
 
-        // UI wiring (must match XML widget types)
         btnStartStop = findViewById(R.id.btnStartStop)
         switchSpeech = findViewById(R.id.switchSpeech)
         detectedLabel = findViewById(R.id.detectedLabel)
 
-        // initial states
+        overlayView.visibility = View.VISIBLE
+        detectedLabel.visibility = View.VISIBLE
+
         isSpeechOn = switchSpeech.isChecked
         btnStartStop.text = if (isCameraRunning) "Stop" else "Start"
+
+        // Init YOLO fallback
+        yoloClassifier = try {
+            YoloV8Classifier(this) // uses yolov8.tflite in assets
+        } catch (e: Exception) {
+            Log.e(TAG, "YOLO init failed: ${e.message}", e)
+            null
+        }
 
         btnStartStop.setOnClickListener {
             isCameraRunning = !isCameraRunning
             btnStartStop.text = if (isCameraRunning) "Stop" else "Start"
-
             if (!isCameraRunning) {
-                // Clear overlay when detection stops
                 overlayView.boxes = emptyList()
+                overlayView.labels = emptyList()
                 overlayView.invalidate()
             }
         }
 
         switchSpeech.setOnCheckedChangeListener { _, isChecked ->
             isSpeechOn = isChecked
+            if (isChecked) {
+                checkAndWarnVolume()
+                setAutoRaise(true)
+            }
         }
 
-        // Camera permission
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
-            PackageManager.PERMISSION_GRANTED) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+            == PackageManager.PERMISSION_GRANTED) {
             startCamera()
         } else {
             requestPermissionLauncher.launch(Manifest.permission.CAMERA)
-        }
-
-        // Load model
-        try {
-            tfliteInterpreter = Interpreter(loadModelFile("yolov8.tflite"))
-            Log.d(TAG, "YOLO model loaded successfully")
-        } catch (e: IOException) {
-            Log.e(TAG, "Failed to load YOLO model: ${e.message}", e)
         }
 
         // Init TTS
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
                 tts?.language = Locale.US
-                Log.d(TAG, "TTS initialized")
             } else {
                 Log.w(TAG, "TTS initialization failed: $status")
             }
         }
     }
 
-    private fun loadModelFile(filename: String): MappedByteBuffer {
-        val fileDescriptor = assets.openFd(filename)
-        val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
-        val channel: FileChannel = inputStream.channel
-        val startOffset = fileDescriptor.startOffset
-        val declaredLength = fileDescriptor.declaredLength
-        return channel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
+    override fun onResume() {
+        super.onResume()
+        checkAndWarnVolume()
     }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        cameraExecutor.shutdown()
+        tts?.stop()
+        tts?.shutdown()
+        try { yoloClassifier?.close() } catch (_: Exception) {}
+    }
+
+    // ---------- Camera ----------
 
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
@@ -175,37 +203,92 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
+    // ---------- Online/Offline switch core ----------
+
     private fun analyzeImage(imageProxy: ImageProxy) {
         try {
-            val bitmap = imageProxy.toBitmap()?.let {
-                Bitmap.createScaledBitmap(it, MODEL_INPUT_SIZE.toInt(), MODEL_INPUT_SIZE.toInt(), true)
+            val bitmap = imageProxy.toBitmap() ?: run { imageProxy.close(); return }
+            val scaled = Bitmap.createScaledBitmap(bitmap, 640, 640, true)
+
+            if (isInternetAvailable()) {
+                // ---------------- Cloud Vision path ----------------
+                val now = System.currentTimeMillis()
+                if (now - lastCloudAt >= CLOUD_MIN_INTERVAL_MS) {
+                    lastCloudAt = now
+
+                    val b64 = bitmapToBase64Jpeg(scaled, quality = 80)
+                    val cloudBoxes = callVisionObjectLocalizationBase64(b64, CLOUD_API_KEY)
+                        .filter { it.score >= CLOUD_MIN_SCORE }
+
+                    if (cloudBoxes.isNotEmpty()) {
+                        val mapped = cloudBoxes.map {
+                            floatArrayOf(it.x1, it.y1, it.x2, it.y2, it.score, -1f)
+                        }
+                        overlayView.post {
+                            overlayView.boxes = mapped
+                            overlayView.labels = cloudBoxes.map { it.label }
+                            overlayView.invalidate()
+                        }
+
+                        val name = cloudBoxes.maxByOrNull { it.score }!!.label
+                        runOnUiThread {
+                            detectedLabel.visibility = View.VISIBLE
+                            detectedLabel.text = "Cloud: $name"
+                        }
+                        if (isSpeechOn) maybeSpeak(name)
+                    } else {
+                        overlayView.post {
+                            overlayView.boxes = emptyList()
+                            overlayView.labels = emptyList()
+                            overlayView.invalidate()
+                        }
+                        runOnUiThread { detectedLabel.text = "Detected: None" }
+                    }
+                }
+            } else {
+                // ---------------- YOLO (offline) path ----------------
+                val detections = yoloClassifier?.infer(scaled).orEmpty()
+
+                if (detections.isNotEmpty()) {
+                    val boxes = ArrayList<FloatArray>(detections.size)
+                    val labels = ArrayList<String>(detections.size)
+                    for (det in detections) {
+                        val box = det.boundingBox
+                        val w = scaled.width.toFloat()
+                        val h = scaled.height.toFloat()
+                        val x1 = (box.left / w).coerceIn(0f, 1f)
+                        val y1 = (box.top / h).coerceIn(0f, 1f)
+                        val x2 = (box.right / w).coerceIn(0f, 1f)
+                        val y2 = (box.bottom / h).coerceIn(0f, 1f)
+                        val cat = det.categories.firstOrNull()
+                        val label = cat?.label ?: "Object"
+                        val score = cat?.score ?: 0f
+
+                        boxes.add(floatArrayOf(x1, y1, x2, y2, score, -1f))
+                        labels.add(label)
+                    }
+
+                    overlayView.post {
+                        overlayView.boxes = boxes
+                        overlayView.labels = labels
+                        overlayView.invalidate()
+                    }
+
+                    val top = labels.getOrNull(0) ?: "Object"
+                    runOnUiThread {
+                        detectedLabel.visibility = View.VISIBLE
+                        detectedLabel.text = "YOLO: $top"
+                    }
+                    if (isSpeechOn) maybeSpeak(top)
+                } else {
+                    overlayView.post {
+                        overlayView.boxes = emptyList()
+                        overlayView.labels = emptyList()
+                        overlayView.invalidate()
+                    }
+                    runOnUiThread { detectedLabel.text = "Detected: None" }
+                }
             }
-            if (bitmap == null) {
-                imageProxy.close()
-                return
-            }
-
-            val inputBuffer = ByteBuffer.allocateDirect(
-                1 * MODEL_INPUT_SIZE.toInt() * MODEL_INPUT_SIZE.toInt() * 3 * 4
-            ).apply { order(ByteOrder.nativeOrder()) }
-            bitmapToFloatBuffer(bitmap, inputBuffer)
-            inputBuffer.rewind()
-
-            val outputBuffer = Array(1) { Array(84) { FloatArray(8400) } }
-            tfliteInterpreter?.run(inputBuffer, outputBuffer)
-
-            val detectedBoxes = parseYoloOutput(outputBuffer) // normalized coords (0..1)
-            overlayView.post { overlayView.boxes = detectedBoxes }
-
-            // Update text label
-            val topLabel = detectedBoxes.maxByOrNull { it[4] }?.let {
-                val idx = it[5].toInt()
-                if (idx in COCO_CLASSES.indices) COCO_CLASSES[idx] else "Unknown"
-            } ?: "None"
-            runOnUiThread { detectedLabel.text = "Detected object: $topLabel" }
-
-            // TTS if enabled
-            if (isSpeechOn) handleTtsPersistence(detectedBoxes)
 
         } catch (e: Exception) {
             Log.e(TAG, "analyzeImage error: ${e.message}", e)
@@ -214,117 +297,199 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun handleTtsPersistence(detectedBoxes: List<FloatArray>) {
-        val presentLabels = detectedBoxes.mapNotNull {
-            val idx = it[5].toInt()
-            if (idx in COCO_CLASSES.indices) COCO_CLASSES[idx] else null
-        }.toSet()
+    private fun isInternetAvailable(): Boolean {
+        val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+        val network = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(network) ?: return false
+        return caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+    }
 
-        for (label in presentLabels) detectionCounters[label] = (detectionCounters[label] ?: 0) + 1
-        val labelsToDecay = detectionCounters.keys.toList()
-        for (label in labelsToDecay) if (!presentLabels.contains(label)) {
-            val count = (detectionCounters[label] ?: 0) - 1
-            if (count <= 0) detectionCounters.remove(label) else detectionCounters[label] = count
+    // ---------- TTS helpers ----------
+
+    private fun maybeSpeak(text: String) {
+        val now = System.currentTimeMillis()
+        if (text != lastSpoken || now - lastSpokenTimeMs > SPEECH_COOLDOWN_MS) {
+            lastSpoken = text
+            lastSpokenTimeMs = now
+            runOnUiThread {
+                checkAndWarnVolume()
+                if (isAutoRaiseEnabled()) ensureVolumeFloor(25, 50, true)
+                nudgeIfBluetoothLow()
+                val am = getSystemService(AUDIO_SERVICE) as AudioManager
+                am.requestAudioFocus({}, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                tts?.speak(text, TextToSpeech.QUEUE_FLUSH, Bundle(), text)
+            }
+        }
+    }
+
+    private fun checkAndWarnVolume() {
+        val am = getSystemService(AUDIO_SERVICE) as AudioManager
+        val vol = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+        if (vol == 0) {
+            val anchor: View = findViewById(R.id.previewView) ?: findViewById(android.R.id.content)
+            Snackbar
+                .make(anchor, "Media volume is muted — TTS will be silent.", Snackbar.LENGTH_LONG)
+                .setAction("Sound settings") {
+                    startActivity(android.content.Intent(android.provider.Settings.ACTION_SOUND_SETTINGS))
+                }
+                .show()
+        }
+    }
+
+    private fun setAutoRaise(enabled: Boolean) =
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putBoolean(KEY_AUTO_RAISE_VOLUME, enabled).apply()
+
+    private fun isAutoRaiseEnabled(): Boolean =
+        getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_AUTO_RAISE_VOLUME, true)
+
+    /** If STREAM_MUSIC volume is below a floor, bump it to a target. Returns true if changed. */
+    private fun ensureVolumeFloor(
+        minThresholdPercent: Int = 25,
+        raiseToPercent: Int = 50,
+        showSystemUi: Boolean = true
+    ): Boolean {
+        val am = getSystemService(AUDIO_SERVICE) as AudioManager
+        val minIdx = try {
+            val m = AudioManager::class.java.getMethod(
+                "getStreamMinVolume",
+                Int::class.javaPrimitiveType
+            )
+            m.invoke(am, AudioManager.STREAM_MUSIC) as Int
+        } catch (_: Throwable) { 0 }
+
+        val maxIdx = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        val curIdx = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+        if (maxIdx <= 0) return false
+
+        val curPercent = (curIdx * 100f) / maxIdx
+        if (curPercent >= minThresholdPercent.coerceIn(0, 100)) return false
+
+        val targetIdx = (maxIdx * (raiseToPercent.coerceIn(0, 100) / 100f))
+            .toInt()
+            .coerceIn(minIdx.coerceAtLeast(1), maxIdx)
+        if (targetIdx <= curIdx) return false
+
+        val flags = if (showSystemUi) AudioManager.FLAG_SHOW_UI else 0
+        am.setStreamVolume(AudioManager.STREAM_MUSIC, targetIdx, flags)
+        return true
+    }
+
+    /** True if audio is currently routed to a Bluetooth output. */
+    private fun isBluetoothOutputActive(): Boolean {
+        val am = getSystemService(AUDIO_SERVICE) as AudioManager
+        val outputs = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+        return outputs.any {
+            it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                    it.type == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                    it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+        }
+    }
+
+    /** If BT is active, show a small nudge to raise volume on the headset itself. */
+    private fun nudgeIfBluetoothLow() {
+        if (isBluetoothOutputActive()) {
+            val anchor: View = findViewById(R.id.previewView) ?: findViewById(android.R.id.content)
+            Snackbar
+                .make(
+                    anchor,
+                    "Bluetooth output active. If speech is quiet, increase volume on the headset.",
+                    Snackbar.LENGTH_LONG
+                )
+                .show()
+        }
+    }
+
+    // ---------- Vision helpers ----------
+
+    private fun bitmapToBase64Jpeg(bitmap: Bitmap, quality: Int = 80): String {
+        val baos = java.io.ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.JPEG, quality, baos)
+        val bytes = baos.toByteArray()
+        return Base64.encodeToString(bytes, Base64.NO_WRAP)
+    }
+
+    private fun callVisionObjectLocalizationBase64(
+        base64Jpeg: String,
+        apiKey: String
+    ): List<VisionBox> {
+        if (apiKey.isBlank()) {
+            Log.w(TAG, "Vision key missing; skipping cloud call.")
+            return emptyList()
         }
 
-        val stableCandidates = detectionCounters.filter { it.value >= SPEECH_PERSISTENCE_FRAMES }.keys
-        if (stableCandidates.isNotEmpty()) {
-            val top = detectedBoxes
-                .filter { it[5].toInt() in COCO_CLASSES.indices }
-                .filter { COCO_CLASSES[it[5].toInt()] in stableCandidates }
-                .maxByOrNull { it[4] }
+        val url = "https://vision.googleapis.com/v1/images:annotate?key=$apiKey"
 
-            top?.let { box ->
-                val className = COCO_CLASSES.getOrElse(box[5].toInt()) { "Unknown" }
-                val now = System.currentTimeMillis()
-                if (className != lastSpoken || now - lastSpokenTimeMs > SPEECH_COOLDOWN_MS) {
-                    lastSpoken = className
-                    lastSpokenTimeMs = now
-                    runOnUiThread { tts?.speak(className, TextToSpeech.QUEUE_FLUSH, null, className) }
+        val features = JSONArray().apply {
+            put(JSONObject().apply { put("type", "OBJECT_LOCALIZATION") })
+        }
+        val image = JSONObject().apply { put("content", base64Jpeg) }
+        val requestObj = JSONObject().apply {
+            put("image", image)
+            put("features", features)
+        }
+        val root = JSONObject().apply {
+            put("requests", JSONArray().put(requestObj))
+        }
+
+        val req = Request.Builder()
+            .url(url)
+            .post(root.toString().toRequestBody(JSON))
+            .build()
+
+        return try {
+            httpClient.newCall(req).execute().use { resp ->
+                val bodyText = resp.body?.string()
+                if (!resp.isSuccessful || bodyText.isNullOrEmpty()) {
+                    Log.w(TAG, "Vision API failed: ${resp.code} ${resp.message}")
+                    emptyList()
+                } else {
+                    parseVisionResponse(bodyText)
                 }
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "Vision call error: ${e.message}", e)
+            emptyList()
         }
     }
 
-    private fun parseYoloOutput(output: Array<Array<FloatArray>>): List<FloatArray> {
-        val boxes = mutableListOf<FloatArray>()
-        val preds = output[0]
-        val numClasses = 80
-        val numCandidates = 8400
-        val confidenceThreshold = CONFIDENCE_THRESHOLD
-        val nmsThreshold = 0.45f
+    private fun parseVisionResponse(jsonText: String): List<VisionBox> {
+        val out = mutableListOf<VisionBox>()
+        try {
+            val root = JSONObject(jsonText)
+            val responses = root.optJSONArray("responses") ?: return emptyList()
+            if (responses.length() == 0) return emptyList()
+            val r0 = responses.getJSONObject(0)
+            val anns = r0.optJSONArray("localizedObjectAnnotations") ?: return emptyList()
 
-        for (i in 0 until numCandidates) {
-            val x = preds[0][i]; val y = preds[1][i]; val w = preds[2][i]; val h = preds[3][i]
+            for (i in 0 until anns.length()) {
+                val a = anns.getJSONObject(i)
+                val name = a.optString("name", "Unknown")
+                val score = a.optDouble("score", 0.0).toFloat()
 
-            var maxClass = -1; var maxScore = 0f
-            for (c in 0 until numClasses) {
-                val score = preds[4 + c][i]
-                if (score > maxScore) { maxScore = score; maxClass = c }
+                val poly = a.getJSONObject("boundingPoly").getJSONArray("normalizedVertices")
+                var minX = 1f; var minY = 1f; var maxX = 0f; var maxY = 0f
+                for (j in 0 until poly.length()) {
+                    val v = poly.getJSONObject(j)
+                    val x = v.optDouble("x", 0.0).toFloat().coerceIn(0f, 1f)
+                    val y = v.optDouble("y", 0.0).toFloat().coerceIn(0f, 1f)
+                    if (x < minX) minX = x
+                    if (y < minY) minY = y
+                    if (x > maxX) maxX = x
+                    if (y > maxY) maxY = y
+                }
+                out.add(VisionBox(minX, minY, maxX, maxY, score, name))
             }
-            if (maxScore <= confidenceThreshold) continue
-
-            val needsNormalize = (x > 1.5f || y > 1.5f || w > 1.5f || h > 1.5f)
-            var cx = x; var cy = y; var ww = w; var hh = h
-            if (needsNormalize) { cx /= MODEL_INPUT_SIZE; cy /= MODEL_INPUT_SIZE; ww /= MODEL_INPUT_SIZE; hh /= MODEL_INPUT_SIZE }
-            val x1 = (cx - ww / 2f).coerceIn(0f, 1f)
-            val y1 = (cy - hh / 2f).coerceIn(0f, 1f)
-            val x2 = (cx + ww / 2f).coerceIn(0f, 1f)
-            val y2 = (cy + hh / 2f).coerceIn(0f, 1f)
-            boxes.add(floatArrayOf(x1, y1, x2, y2, maxScore, maxClass.toFloat()))
+        } catch (e: Exception) {
+            Log.e(TAG, "parseVisionResponse error: ${e.message}", e)
         }
-        return nonMaxSuppression(boxes, nmsThreshold)
-    }
-
-    private fun nonMaxSuppression(boxes: List<FloatArray>, nmsThreshold: Float): List<FloatArray> {
-        val finalBoxes = mutableListOf<FloatArray>()
-        val sortedBoxes = boxes.sortedByDescending { it[4] }
-        val picked = BooleanArray(sortedBoxes.size)
-        for (i in sortedBoxes.indices) {
-            if (picked[i]) continue
-            val A = sortedBoxes[i]; finalBoxes.add(A)
-            for (j in i + 1 until sortedBoxes.size) {
-                if (picked[j]) continue
-                val B = sortedBoxes[j]
-                if (iou(A, B) > nmsThreshold) picked[j] = true
-            }
-        }
-        return finalBoxes
-    }
-
-    private fun iou(a: FloatArray, b: FloatArray): Float {
-        val x1 = maxOf(a[0], b[0]); val y1 = maxOf(a[1], b[1])
-        val x2 = minOf(a[2], b[2]); val y2 = minOf(a[3], b[3])
-        val interW = maxOf(0f, x2 - x1); val interH = maxOf(0f, y2 - y1)
-        val inter = interW * interH
-        val areaA = (a[2] - a[0]) * (a[3] - a[1])
-        val areaB = (b[2] - b[0]) * (b[3] - b[1])
-        return inter / (areaA + areaB - inter + 1e-6f)
-    }
-
-    private fun bitmapToFloatBuffer(bitmap: Bitmap, byteBuffer: ByteBuffer) {
-        val size = MODEL_INPUT_SIZE.toInt()
-        val intValues = IntArray(size * size)
-        bitmap.getPixels(intValues, 0, size, 0, 0, size, size)
-        var pixel = 0
-        for (i in 0 until size) for (j in 0 until size) {
-            val value = intValues[pixel++]
-            byteBuffer.putFloat(((value shr 16 and 0xFF) / 255.0f))
-            byteBuffer.putFloat(((value shr 8 and 0xFF) / 255.0f))
-            byteBuffer.putFloat(((value and 0xFF) / 255.0f))
-        }
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        cameraExecutor.shutdown()
-        tfliteInterpreter?.close()
-        tts?.stop()
-        tts?.shutdown()
+        return out
     }
 }
 
-// Extension to convert ImageProxy to Bitmap
+// ---- ImageProxy -> Bitmap helper ----
 fun ImageProxy.toBitmap(): Bitmap? {
     val yBuffer = planes[0].buffer
     val uBuffer = planes[1].buffer
@@ -336,7 +501,13 @@ fun ImageProxy.toBitmap(): Bitmap? {
     yBuffer.get(nv21, 0, ySize)
     vBuffer.get(nv21, ySize, vSize)
     uBuffer.get(nv21, ySize + vSize, uSize)
-    val yuvImage = android.graphics.YuvImage(nv21, android.graphics.ImageFormat.NV21, width, height, null)
+    val yuvImage = android.graphics.YuvImage(
+        nv21,
+        android.graphics.ImageFormat.NV21,
+        width,
+        height,
+        null
+    )
     val out = java.io.ByteArrayOutputStream()
     yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 90, out)
     val imageBytes = out.toByteArray()

@@ -13,8 +13,15 @@ class OverlayView @JvmOverloads constructor(
     defStyleAttr: Int = 0
 ) : View(context, attrs, defStyleAttr) {
 
-    // boxes: [x1_norm, y1_norm, x2_norm, y2_norm, confidence, classIndex]
+    // boxes: [x1_norm, y1_norm, x2_norm, y2_norm, confidence, -1, optional label?]
     var boxes: List<FloatArray> = emptyList()
+        set(value) {
+            field = value
+            invalidate()
+        }
+
+    // separate label list for Vision detections
+    var labels: List<String> = emptyList()
         set(value) {
             field = value
             invalidate()
@@ -37,20 +44,21 @@ class OverlayView @JvmOverloads constructor(
         val vw = width.toFloat()
         val vh = height.toFloat()
 
-        for (box in boxes) {
+        for ((i, box) in boxes.withIndex()) {
             if (box.size < 6) continue
             val x1 = box[0] * vw
             val y1 = box[1] * vh
             val x2 = box[2] * vw
             val y2 = box[3] * vh
             val conf = box[4]
-            val cls = box[5].toInt()
-            val name = if (cls in MainActivity.COCO_CLASSES.indices) MainActivity.COCO_CLASSES[cls] else "Unknown"
 
-            // Draw rectangle and label
+            val labelText = if (i < labels.size) labels[i] else "Object"
+            val label = "$labelText ${"%.2f".format(conf)}"
+
+            // Draw rectangle
             canvas.drawRect(x1, y1, x2, y2, boxPaint)
-            val label = "$name ${"%.2f".format(conf)}"
-            // draw text above box if possible
+
+            // Draw text just above top-left corner
             val textY = (y1 - 8f).coerceAtLeast(36f)
             canvas.drawText(label, x1, textY, textPaint)
         }
